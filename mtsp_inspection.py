@@ -506,6 +506,11 @@ class TSPApp:
             state=tk.DISABLED)
         self.stop_btn.pack(fill=tk.X, pady=1)
 
+        self.hist_btn = tk.Button(
+            ctrl, text="稼働時間ヒストグラム", command=self.show_time_histogram,
+            bg="#3F51B5", fg="white", relief=tk.FLAT, pady=4, cursor="hand2")
+        self.hist_btn.pack(fill=tk.X, pady=2)
+
         # 結果表示セクション
         self._sep(ctrl, "結果")
         self.stat_nodes    = self._lbl(ctrl, "建物数: 0")
@@ -831,6 +836,60 @@ class TSPApp:
                      ha="center", va="bottom", fontsize=8.5,
                      color="#333333", zorder=10)
 
+    def show_time_histogram(self):
+        """
+        判定士ごとの稼働時間（完了までの時間）の分布をヒストグラムで
+        別ウィンドウにポップアップ表示する。時間の平滑化（makespan均等化）が
+        実際にどの程度効いているかを一目で確認できる。
+        """
+        if not self.per_time:
+            messagebox.showinfo("情報", "先に「計画を実行」または「必要判定士数を計算」を行ってください")
+            return
+
+        times = np.array(self.per_time)
+        m_total = len(times)
+        avg, mn, mx, std = times.mean(), times.min(), times.max(), times.std()
+
+        win = tk.Toplevel(self.root)
+        win.title("判定士ごとの稼働時間ヒストグラム")
+        win.geometry("640x520")
+        win.configure(bg="#f0f0f0")
+
+        fig = Figure(figsize=(6, 4.4), dpi=100)
+        fig.patch.set_facecolor("#ffffff")
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#ffffff")
+
+        n_bins = max(5, min(30, int(np.sqrt(m_total)) + 5))
+        ax.hist(times, bins=n_bins, color="#3F51B5", alpha=0.8, edgecolor="white")
+
+        ax.axvline(avg, color="#e74c3c", linestyle="--", linewidth=1.5,
+                  label=f"平均 {avg:.2f}h")
+        ax.axvline(mx, color="#FF9800", linestyle=":", linewidth=1.5,
+                  label=f"最大(makespan) {mx:.2f}h")
+
+        ax.set_xlabel("稼働時間（作業完了までの時間） [h]", color="#333")
+        ax.set_ylabel("判定士の人数", color="#333")
+        ax.set_title(f"判定士 {m_total}人 の稼働時間分布", color="#333")
+        ax.tick_params(colors="#666")
+        for spine in ax.spines.values():
+            spine.set_color("#cccccc")
+        ax.legend(fontsize=9, facecolor="#ffffff", edgecolor="#cccccc")
+        ax.grid(True, alpha=0.3, axis="y")
+
+        fig.tight_layout(pad=2)
+        c = FigureCanvasTkAgg(fig, master=win)
+        c.draw()
+        c.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+
+        stats_txt = (
+            f"最小: {mn:.3f} h　　最大: {mx:.3f} h　　"
+            f"平均: {avg:.3f} h　　標準偏差: {std:.3f} h　　"
+            f"差(最大-最小): {mx - mn:.3f} h"
+        )
+        tk.Label(win, text=stats_txt, bg="#f0f0f0", fg="#333",
+                font=("Arial", 9)).pack(fill=tk.X, padx=8, pady=(0, 8))
+
     def _update_per_text(self, per_time, per_dist=None):
         """判定士ごとの稼働時間・移動距離テーブルを更新する"""
         self.per_text.config(state=tk.NORMAL)
@@ -865,9 +924,6 @@ class TSPApp:
             messagebox.showerror("エラー", "入力値を確認してください")
             return
 
-        if m > len(COLORS):
-            messagebox.showerror("エラー", f"判定士数は {len(COLORS)} 以下にしてください")
-            return
         n_depots = min(n_depots, len(self.nodes))
 
         self.solving = True
