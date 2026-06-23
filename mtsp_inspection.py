@@ -232,7 +232,7 @@ class TSPApp:
         ctrl.pack_propagate(False)
 
         tk.Label(ctrl, text="応急危険度判定 mTSP",
-                 font=("Arial", 12, "bold"), bg="#f0f0f0").pack(pady=(0,3))
+                 font=("Arial", 16, "bold"), bg="#f0f0f0").pack(pady=(0,3))
         tk.Label(ctrl, text=f"CPU: {self.n_cpu} コア",
                  bg="#f0f0f0", fg="#888", font=("Arial", 8)).pack(anchor="w")
 
@@ -245,10 +245,10 @@ class TSPApp:
         tk.Label(ctrl, text="建物ごとに判定時間をランダム設定",
                  bg="#f0f0f0", fg="#666", font=("Arial", 8)).pack(anchor="w")
         tk.Button(ctrl, text="ランダム建物生成", command=self.generate_random,
-                  bg="#4CAF50", fg="white", relief=tk.FLAT, pady=4
+                  bg="#4CAF50", fg="white", relief=tk.FLAT, pady=4, cursor="hand2"
                   ).pack(fill=tk.X, pady=2)
         tk.Button(ctrl, text="クリア", command=self.clear_nodes,
-                  bg="#f44336", fg="white", relief=tk.FLAT, pady=3
+                  bg="#f44336", fg="white", relief=tk.FLAT, pady=3, cursor="hand2"
                   ).pack(fill=tk.X, pady=1)
 
         # デポ設定セクション
@@ -278,19 +278,19 @@ class TSPApp:
         # 実行ボタン群
         self.solve_btn = tk.Button(
             ctrl, text="計画を実行", command=self.solve_tsp,
-            bg="#2196F3", fg="white", relief=tk.FLAT, pady=7,
+            bg="#2196F3", fg="white", relief=tk.FLAT, pady=7, cursor="hand2",
             font=("Arial", 10, "bold"))
         self.solve_btn.pack(fill=tk.X, pady=4)
 
         self.min_m_btn = tk.Button(
             ctrl, text="必要判定士数を計算", command=self.calc_min_m,
-            bg="#00796B", fg="white", relief=tk.FLAT, pady=5,
+            bg="#00796B", fg="white", relief=tk.FLAT, pady=5, cursor="hand2",
             font=("Arial", 9, "bold"))
         self.min_m_btn.pack(fill=tk.X, pady=2)
 
         self.stop_btn = tk.Button(
             ctrl, text="中止", command=lambda: setattr(self,"solving",False),
-            bg="#FF9800", fg="white", relief=tk.FLAT, pady=3,
+            bg="#f44336", fg="white", relief=tk.FLAT, pady=3, cursor="hand2",
             state=tk.DISABLED)
         self.stop_btn.pack(fill=tk.X, pady=1)
 
@@ -320,7 +320,7 @@ class TSPApp:
         self._sep(ctrl, "ベンチマーク")
         self.bench_btn = tk.Button(
             ctrl, text="ベンチマーク実行", command=self.run_benchmark,
-            bg="#9C27B0", fg="white", relief=tk.FLAT, pady=4)
+            bg="#9C27B0", fg="white", relief=tk.FLAT, pady=4, cursor="hand2")
         self.bench_btn.pack(fill=tk.X, pady=3)
 
         # 右側キャンバス（matplotlib）
@@ -329,8 +329,8 @@ class TSPApp:
 
         self.fig = Figure(figsize=(10, 8), dpi=100)
         self.ax  = self.fig.add_subplot(111)
-        self.ax.set_facecolor("#1a1a2e")
-        self.fig.patch.set_facecolor("#16213e")
+        self.ax.set_facecolor("#ffffff")
+        self.fig.patch.set_facecolor("#ffffff")
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.draw()
@@ -560,16 +560,18 @@ class TSPApp:
         """
         self.fig.clear()
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor("#1a1a2e")
+        self.ax.set_facecolor("#ffffff")
         self.ax.set_xlim(-0.02, 1.02)
         self.ax.set_ylim(-0.02, 1.02)
-        self.ax.tick_params(colors="#aaa")
+        self.ax.tick_params(colors="#666")
+        for spine in self.ax.spines.values():
+            spine.set_color("#cccccc")
 
         n     = len(self.nodes)
         extra = f"  未割当: {self.unassigned}" if self.unassigned else ""
         self.ax.set_title(
             f"応急危険度判定 mTSP  ({n:,} 建物{extra})",
-            color="white", fontsize=11)
+            color="#333333", fontsize=11)
 
         if not self.nodes:
             self.canvas.draw_idle()
@@ -595,23 +597,25 @@ class TSPApp:
                                    zorder=3, vmin=it.min(), vmax=it.max())
             try:
                 cb = self.fig.colorbar(sc, ax=self.ax, fraction=0.03, pad=0.01)
-                cb.set_label("判定時間 (分)", color="white", fontsize=8)
-                cb.ax.yaxis.set_tick_params(color="white", labelcolor="white")
+                cb.set_label("判定時間 (分)", color="#333333", fontsize=8)
+                cb.ax.yaxis.set_tick_params(color="#666", labelcolor="#333333")
             except Exception:
                 pass
         else:
             size = max(2, 25 - n // 1000)
             self.ax.scatter(coords[:, 0], coords[:, 1],
-                            c="#76ff03", s=size, alpha=0.75, zorder=3)
+                            c="#4CAF50", s=size, alpha=0.75, zorder=3)
 
         # デポを金色の星マークで表示
         dep = self.depot_idx if self.nodes else 0
         if 0 <= dep < n:
             self.ax.scatter([coords[dep, 0]], [coords[dep, 1]],
-                            c="#FFD700", s=200, marker="*", zorder=6,
+                            c="#E53935", s=200, marker="*",
+                            edgecolors="white", linewidths=0.8, zorder=6,
                             label="デポ")
             self.ax.legend(loc="upper right", fontsize=9,
-                           facecolor="#1a1a2e", labelcolor="white")
+                           facecolor="#ffffff", labelcolor="#333333",
+                           edgecolor="#cccccc")
 
         self.canvas.draw_idle()
 
