@@ -3,18 +3,20 @@
 Time-Constrained mTSP for Emergency Building Inspection
 
 【概要】
-地震等の災害後に複数の判定士が拠点（デポ）から出発し、
+地震等の災害後に複数の判定士が複数拠点（デポ）から出発し、
 エリア内の全建物を手分けして応急危険度判定を行う巡回計画を作成する。
 
 【アルゴリズム】
+- k-means クラスタリングで複数拠点を建物分布に応じて自動配置
+- 建物数に比例して判定士数を各拠点へ配分
 - 最近傍法 (Nearest Neighbor) + KDTree による O(n log n) 近傍探索
-- min-heap によるラウンドロビン割当（makespan 最小化）
-- ProcessPoolExecutor による並列試行（複数デポ候補から最短を採用）
-- 最小判定士数は二分探索で O(log n) 回の試行で確定
+- min-heap によるラウンドロビン割当（拠点ごとの makespan 最小化）
+- ProcessPoolExecutor による拠点間の並列計算
+- 最小判定士数は拠点ごとに二分探索で O(log n) 回の試行で確定し合算
 
 【制約条件】
 1. 各建物は1回だけ判定（visited フラグ）
-2. 判定士は拠点から出発・拠点に帰還
+2. 判定士は自拠点から出発・自拠点に帰還（拠点間で判定士は共有しない）
 3. 移動時間（距離 / 速度）を稼働時間に加算
 4. 判定時間（建物ごとに設定）を稼働時間に加算
 5. 現在時刻 + 移動 + 判定 + デポ帰還 ≤ 最大稼働時間 を満たす場合のみ割当
@@ -33,6 +35,7 @@ import random
 import heapq
 import numpy as np
 from scipy.spatial import KDTree
+from scipy.cluster.vq import kmeans2
 import matplotlib
 matplotlib.rcParams['font.family'] = 'Meiryo'
 from matplotlib.figure import Figure
@@ -186,6 +189,7 @@ def _parallel_mtsp(coords, inspect_times, depot_indices,
 
     デポ位置によってルートの質が変わるため、複数候補を並列試行することで
     解の質を向上させる（greedy の確率的改善）。
+    ※ ベンチマーク（単一拠点想定）用に残している関数。
     """
     args_list = [
         (coords, inspect_times, d, m, area_km, speed_kmh, max_work_h)
@@ -202,6 +206,215 @@ def _parallel_mtsp(coords, inspect_times, depot_indices,
     return best  # (makespan, total_dist, routes, per_time, per_dist, unassigned)
 
 
+# ── 複数拠点対応 ──────────────────────────────────────────────────────────────
+
+def _auto_place_depots(coords, n_depots, seed=0):
+    """
+    建物座標を k-means でクラスタリングし、各クラスタの重心に最も近い
+    実在の建物を拠点として採用する（複数拠点を建物分布に応じて自動配置）。
+
+    Returns:
+        depot_indices: 各拠点のグローバル建物インデックス（長さ n_depots）
+        labels       : 各建物がどの拠点（クラスタ）に属するか（長さ n）
+    """
+    n = len(coords)
+    n_depots = max(1, min(n_depots, n))
+
+    if n_depots == 1:
+        labels = np.zeros(n, dtype=int)
+        centroids = coords.mean(axis=0, keepdims=True)
+    else:
+        try:
+            centroids, labels = kmeans2(coords, n_depots, seed=seed, minit="++")
+        except Exception:
+            # クラスタリングが失敗した場合のフォールバック（ランダム初期点＋最近接割当）
+            rng = np.random.default_rng(seed)
+            init_idx = rng.choice(n, size=n_depots, replace=False)
+            centroids = coords[init_idx]
+            dists = np.linalg.norm(coords[:, None, :] - centroids[None, :, :], axis=2)
+            labels = np.argmin(dists, axis=1)
+
+    depot_indices = []
+    for i in range(n_depots):
+        members = np.where(labels == i)[0]
+        if len(members) == 0:
+            # 空クラスタは重心に最も近い建物で代替
+            nearest = int(np.argmin(np.linalg.norm(coords - centroids[i], axis=1)))
+            depot_indices.append(nearest)
+            labels[nearest] = i
+            continue
+        sub = coords[members]
+        local_best = int(np.argmin(np.linalg.norm(sub - centroids[i], axis=1)))
+        depot_indices.append(int(members[local_best]))
+    return depot_indices, labels
+
+
+def _allocate_inspectors(cluster_sizes, total_m):
+    """
+    建物数（クラスタサイズ）に比例して判定士数を拠点へ配分する。
+    各クラスタの合計が total_m になるよう、小数部の大きい順に人数を調整する。
+    建物が1棟以上あるクラスタには最低1人を確保する。
+    """
+    n_clusters = len(cluster_sizes)
+    total_n = sum(cluster_sizes)
+    if total_n == 0:
+        return [0] * n_clusters
+
+    raw  = [total_m * s / total_n for s in cluster_sizes]
+    base = [int(np.floor(r)) if s > 0 else 0 for r, s in zip(raw, cluster_sizes)]
+    for i, s in enumerate(cluster_sizes):
+        if s > 0 and base[i] == 0:
+            base[i] = 1
+
+    diff  = total_m - sum(base)
+    order = sorted(range(n_clusters), key=lambda i: raw[i] - base[i], reverse=True)
+
+    guard = 0
+    while diff > 0 and guard < n_clusters * 1000:
+        i = order[guard % n_clusters]
+        if cluster_sizes[i] > 0:
+            base[i] += 1
+            diff -= 1
+        guard += 1
+    while diff < 0 and guard < n_clusters * 2000:
+        i = order[guard % n_clusters]
+        if base[i] > 1:
+            base[i] -= 1
+            diff += 1
+        guard += 1
+    return base
+
+
+def _mtsp_cluster_worker(args):
+    """1拠点（クラスタ）分の _mtsp_worker を実行し、グローバル建物インデックスに変換して返す"""
+    (members, coords_sub, it_sub, local_depot,
+     m_i, area_km, speed_kmh, max_work_h) = args
+
+    if m_i <= 0 or len(coords_sub) <= 1:
+        unassigned = max(0, len(coords_sub) - 1)
+        return (0.0, 0.0, [], [], [], unassigned)
+
+    makespan, total_dist, routes, per_time, per_dist, unassigned = _mtsp_worker(
+        (coords_sub, it_sub, local_depot, m_i, area_km, speed_kmh, max_work_h))
+    global_routes = [[int(members[i]) for i in r] for r in routes]
+    return (makespan, total_dist, global_routes, per_time, per_dist, unassigned)
+
+
+def _solve_multi_depot(coords, inspect_times, n_depots, m_total,
+                       area_km, speed_kmh, max_work_h, n_workers, seed=0):
+    """
+    複数拠点に対応した mTSP 求解。
+
+    1. k-means で n_depots 個の拠点を建物分布に応じて自動配置
+    2. 各拠点の担当エリア（クラスタ）の建物数に応じて判定士数を比例配分
+    3. 拠点ごとに独立して貪欲法（最近傍法＋min-heap）を実行（拠点間で判定士は共有しない）
+    4. 結果を結合（makespan は全拠点の最大値、距離・未割当は合計）
+    """
+    depot_indices, labels = _auto_place_depots(coords, n_depots, seed=seed)
+    n_depots_actual = len(depot_indices)
+
+    cluster_members = [np.where(labels == i)[0] for i in range(n_depots_actual)]
+    cluster_sizes    = [len(m) for m in cluster_members]
+    m_alloc          = _allocate_inspectors(cluster_sizes, m_total)
+
+    args_list = []
+    for i in range(n_depots_actual):
+        members      = cluster_members[i]
+        depot_global = depot_indices[i]
+        local_depot  = int(np.where(members == depot_global)[0][0])
+        args_list.append((
+            members, coords[members], inspect_times[members], local_depot,
+            m_alloc[i], area_km, speed_kmh, max_work_h
+        ))
+
+    results = [None] * n_depots_actual
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futs = {ex.submit(_mtsp_cluster_worker, a): idx
+                for idx, a in enumerate(args_list)}
+        for f in as_completed(futs):
+            results[futs[f]] = f.result()
+
+    all_routes, all_per_time, all_per_dist = [], [], []
+    total_dist = 0.0
+    total_unassigned = 0
+    makespan = 0.0
+    for ms_i, dist_i, routes_i, pt_i, pd_i, ua_i in results:
+        all_routes.extend(routes_i)
+        all_per_time.extend(pt_i)
+        all_per_dist.extend(pd_i)
+        total_dist       += dist_i
+        total_unassigned += ua_i
+        makespan = max(makespan, ms_i)
+
+    return (makespan, total_dist, all_routes, all_per_time,
+            all_per_dist, total_unassigned, depot_indices)
+
+
+def _min_m_cluster_worker(args):
+    """1拠点（クラスタ）分の最小判定士数を二分探索で求める"""
+    (members, coords_sub, it_sub, local_depot, area_km, speed_kmh, max_work_h) = args
+    n_sub = len(coords_sub)
+    if n_sub <= 1:
+        return (0, (0.0, 0.0, [], [], [], 0), members)
+
+    lo, hi   = 1, n_sub - 1
+    best_m   = hi
+    best_res = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        res = _mtsp_worker((coords_sub, it_sub, local_depot, mid, area_km, speed_kmh, max_work_h))
+        if res[5] == 0:
+            best_m, best_res = mid, res
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return (best_m, best_res, members)
+
+
+def _min_m_multi_depot(coords, inspect_times, n_depots, area_km,
+                       speed_kmh, max_work_h, n_workers, seed=0):
+    """
+    拠点ごとに独立して最小判定士数を二分探索し、合計を返す。
+    拠点間で判定士の共有はないため、拠点ごとの最小値の総和が全体の最小値になる。
+    """
+    depot_indices, labels = _auto_place_depots(coords, n_depots, seed=seed)
+    n_depots_actual = len(depot_indices)
+    cluster_members = [np.where(labels == i)[0] for i in range(n_depots_actual)]
+
+    args_list = []
+    for i in range(n_depots_actual):
+        members      = cluster_members[i]
+        depot_global = depot_indices[i]
+        local_depot  = int(np.where(members == depot_global)[0][0])
+        args_list.append((members, coords[members], inspect_times[members],
+                          local_depot, area_km, speed_kmh, max_work_h))
+
+    results = [None] * n_depots_actual
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futs = {ex.submit(_min_m_cluster_worker, a): idx
+                for idx, a in enumerate(args_list)}
+        for f in as_completed(futs):
+            results[futs[f]] = f.result()
+
+    total_min_m = 0
+    all_routes, all_per_time, all_per_dist = [], [], []
+    total_dist = 0.0
+    makespan = 0.0
+    for best_m, best_res, members in results:
+        total_min_m += best_m
+        if best_res and best_res[2]:
+            _, dist_i, routes_i, pt_i, pd_i, _ = best_res
+            all_routes.extend([[int(members[j]) for j in r] for r in routes_i])
+            all_per_time.extend(pt_i)
+            all_per_dist.extend(pd_i)
+            total_dist += dist_i
+            if pt_i:
+                makespan = max(makespan, max(pt_i))
+
+    return (total_min_m, makespan, total_dist, all_routes,
+            all_per_time, all_per_dist, depot_indices)
+
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
 class TSPApp:
@@ -212,14 +425,13 @@ class TSPApp:
 
         self.nodes        = []    # 建物座標リスト [(x, y), ...]  座標系: [0,1]x[0,1]
         self.inspect_times= []    # 建物ごとの判定時間 [秒]
-        self.depot_idx    = 0     # デポの建物インデックス
+        self.depot_indices= []    # 複数拠点のグローバル建物インデックスリスト
         self.routes       = []    # 判定士ごとの訪問順インデックスリスト
         self.per_time     = []    # 判定士ごとの稼働時間 [時間]
         self.per_dist     = []    # 判定士ごとの移動距離 [km]
         self.unassigned   = 0     # 未割当建物数
         self.solving      = False
         self.n_cpu        = os.cpu_count() or 4
-        self.depot_mode_var = tk.StringVar(value="center")
 
         self._build_ui()
 
@@ -251,27 +463,27 @@ class TSPApp:
                   bg="#f44336", fg="white", relief=tk.FLAT, pady=3, cursor="hand2"
                   ).pack(fill=tk.X, pady=1)
 
-        # デポ設定セクション
-        self._sep(ctrl, "デポ（拠点）")
-        for val, lbl in [("center","中心に自動配置"),
-                          ("random","ランダム"),
-                          ("click", "クリックで指定")]:
-            tk.Radiobutton(ctrl, text=lbl, variable=self.depot_mode_var,
-                           value=val, bg="#f0f0f0").pack(anchor="w")
-        self.depot_label = tk.Label(ctrl, text="デポ: 未設定",
+        # 拠点（デポ）設定セクション
+        self._sep(ctrl, "拠点（デポ）")
+        self._row(ctrl, "拠点数:", "depot_n_var", "3", 6)
+        tk.Label(ctrl,
+                 text="建物の分布（k-means）に応じて自動配置\n"
+                      "各拠点の担当建物数に比例して判定士を配分",
+                 bg="#f0f0f0", fg="#666", font=("Arial", 8),
+                 justify=tk.LEFT).pack(anchor="w")
+        self.depot_label = tk.Label(ctrl, text="拠点: 未配置（計画実行時に自動配置）",
                                     bg="#f0f0f0", fg="#555", font=("Arial",8), anchor="w")
         self.depot_label.pack(fill=tk.X)
 
         # 制約条件セクション
         self._sep(ctrl, "制約条件")
-        self._row(ctrl, "判定士数 m:",        "m_var",       "4",              6)
-        self._row(ctrl, "移動速度 (km/h):",   "speed_var",  "30",              6)
-        self._row(ctrl, "最大稼働時間 (h):",  "maxwork_var", "8",              6)
-        self._row(ctrl, "並列試行回数:",      "starts_var",  str(self.n_cpu),  6)
-        self._row(ctrl, "並列数:",            "workers_var", str(self.n_cpu),  6)
+        self._row(ctrl, "判定士数 m（合計）:", "m_var",       "12",             6)
+        self._row(ctrl, "移動速度 (km/h):",    "speed_var",  "30",              6)
+        self._row(ctrl, "最大稼働時間 (h):",   "maxwork_var", "8",              6)
+        self._row(ctrl, "並列数:",             "workers_var", str(self.n_cpu),  6)
         tk.Label(ctrl,
-                 text="目的関数: 最大終了時間(makespan)を最小化\n"
-                      "→ 最も遅い担当者が早く終わるよう割当",
+                 text="目的関数: 拠点ごとの最大終了時間(makespan)を最小化\n"
+                      "→ 拠点間で判定士は共有せず、独立に巡回計画を作成",
                  bg="#f0f0f0", fg="#1565C0", font=("Arial",8),
                  justify=tk.LEFT).pack(anchor="w", pady=3)
 
@@ -382,9 +594,9 @@ class TSPApp:
         self.per_time = []
         self.per_dist = []
         self.unassigned = 0
-        self.depot_idx = self._auto_depot()
+        self.depot_indices = []
         self.stat_nodes.config(text=f"建物数: {n:,}")
-        self.depot_label.config(text=f"デポ: 拠点 #{self.depot_idx}")
+        self.depot_label.config(text="拠点: 未配置（計画実行時に自動配置）")
         self._reset_result_stats()
         self._redraw()
 
@@ -395,7 +607,9 @@ class TSPApp:
         self.per_time = []
         self.per_dist = []
         self.unassigned = 0
+        self.depot_indices = []
         self.stat_nodes.config(text="建物数: 0")
+        self.depot_label.config(text="拠点: 未配置（計画実行時に自動配置）")
         self._reset_result_stats()
         self._redraw()
 
@@ -411,11 +625,10 @@ class TSPApp:
 
     def calc_min_m(self):
         """
-        二分探索で全棟割当可能な最小判定士数を求める。
+        拠点ごとに二分探索で全棟割当可能な最小判定士数を求め、合計する。
 
-        探索範囲: [1, 建物数]
-        各試行で _mtsp_worker を呼び unassigned == 0 かどうかを確認。
-        O(log n) 回の試行で収束する。
+        各拠点（クラスタ）は独立に動くため、拠点ごとの最小値の総和が
+        全体の最小判定士数になる。各拠点での探索は O(log n_i) 回で収束する。
         """
         if len(self.nodes) < 2:
             messagebox.showwarning("警告", "建物を2棟以上追加してください")
@@ -423,59 +636,41 @@ class TSPApp:
         if self.solving:
             return
         try:
-            speed    = float(self.speed_var.get());    assert speed > 0
-            max_work = float(self.maxwork_var.get());  assert max_work > 0
-            area_km  = float(self.area_var.get());     assert area_km > 0
+            speed     = float(self.speed_var.get());    assert speed > 0
+            max_work  = float(self.maxwork_var.get());  assert max_work > 0
+            area_km   = float(self.area_var.get());     assert area_km > 0
+            n_workers = max(1, int(self.workers_var.get()))
+            n_depots  = max(1, int(self.depot_n_var.get()))
         except Exception:
-            messagebox.showerror("エラー", "移動速度・最大稼働時間・エリアを確認してください")
+            messagebox.showerror("エラー", "移動速度・最大稼働時間・エリア・拠点数を確認してください")
             return
+        n_depots = min(n_depots, len(self.nodes))
 
         self.solving = True
         self.solve_btn.config(state=tk.DISABLED)
         self.min_m_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.stat_status.config(text="状態: 最小判定士数を探索中...")
+        self.stat_status.config(text="状態: 拠点ごとに最小判定士数を探索中...")
         self.progress.start(10)
 
         threading.Thread(
             target=self._min_m_worker,
             args=(list(self.nodes), list(self.inspect_times),
-                  speed, max_work, area_km),
+                  speed, max_work, area_km, n_workers, n_depots),
             daemon=True).start()
 
-    def _min_m_worker(self, nodes, inspect_times, speed, max_work, area_km):
-        """二分探索の実体。バックグラウンドスレッドで実行される。"""
+    def _min_m_worker(self, nodes, inspect_times, speed, max_work, area_km,
+                      n_workers, n_depots):
+        """拠点ごとの二分探索の実体。バックグラウンドスレッドで実行される。"""
         coords = np.array(nodes)
         it     = np.array(inspect_times, dtype=np.float64)
-        depot  = self._auto_depot()
         t0     = time.perf_counter()
-
-        lo, hi   = 1, len(nodes)
-        best_m   = hi
-        best_res = None
-
-        while lo <= hi:
-            if not self.solving:
-                break
-            mid = (lo + hi) // 2
-            self.root.after(0, self.stat_status.config,
-                            {"text": f"状態: 探索中... m={mid} を試行"})
-            res        = _parallel_mtsp(coords, it, [depot],
-                                        mid, area_km, speed, max_work, 1)
-            unassigned = res[5]
-            if unassigned == 0:
-                # m で全棟対応可能 → さらに少ない m を試す
-                best_m   = mid
-                best_res = res
-                hi       = mid - 1
-            else:
-                # m では足りない → m を増やす
-                lo = mid + 1
-
+        res = _min_m_multi_depot(coords, it, n_depots, area_km,
+                                 speed, max_work, n_workers)
         elapsed = time.perf_counter() - t0
-        self.root.after(0, self._on_min_m_done, best_m, best_res, elapsed)
+        self.root.after(0, self._on_min_m_done, res, elapsed)
 
-    def _on_min_m_done(self, min_m, res, elapsed):
+    def _on_min_m_done(self, res, elapsed):
         """最小判定士数探索完了時のコールバック（メインスレッドで実行）"""
         self.solving = False
         self.solve_btn.config(state=tk.NORMAL)
@@ -483,43 +678,33 @@ class TSPApp:
         self.stop_btn.config(state=tk.DISABLED)
         self.progress.stop()
 
-        self.stat_min_m.config(text=f"最小必要判定士数: {min_m} 人")
-        self.stat_time.config(text=f"計算時間: {elapsed:.2f} 秒")
-        self.m_var.set(str(min_m))  # 判定士数入力欄に反映
+        total_min_m, makespan, total_dist, routes, per_time, per_dist, depot_indices = res
 
-        if res:
-            makespan, total_dist, routes, per_time, per_dist, _ = res
-            self.routes     = routes
-            self.per_time   = per_time
-            self.per_dist   = per_dist
-            self.unassigned = 0
-            self.depot_idx  = routes[0][0]
-            h = int(makespan); mn = int((makespan - h) * 60)
-            self.stat_makespan.config(text=f"最大終了時間: {h}h{mn:02d}m")
-            self.stat_unassign.config(text="未割当建物: 0 棟 (全棟完了)",
-                                      fg="#2e7d32")
-            self.stat_dist.config(text=f"総移動距離: {total_dist:.1f} km")
-            self.stat_m.config(text=f"判定士数: {min_m} (最小)")
-            self._update_per_text(per_time, per_dist)
-            self._redraw()
+        self.stat_min_m.config(text=f"最小必要判定士数: {total_min_m} 人")
+        self.stat_time.config(text=f"計算時間: {elapsed:.2f} 秒")
+        self.m_var.set(str(total_min_m))  # 判定士数入力欄に反映
+
+        self.routes       = routes
+        self.per_time     = per_time
+        self.per_dist     = per_dist
+        self.unassigned   = 0
+        self.depot_indices = depot_indices
+        self.depot_label.config(text=f"拠点: {len(depot_indices)} 箇所に自動配置")
+
+        h = int(makespan); mn = int((makespan - h) * 60)
+        self.stat_makespan.config(text=f"最大終了時間: {h}h{mn:02d}m")
+        self.stat_unassign.config(text="未割当建物: 0 棟 (全棟完了)",
+                                  fg="#2e7d32")
+        self.stat_dist.config(text=f"総移動距離: {total_dist:.1f} km")
+        self.stat_m.config(text=f"判定士数: {total_min_m} (最小)")
+        self._update_per_text(per_time, per_dist)
+        self._redraw()
 
         self.stat_status.config(
-            text=f"状態: 完了 — 最小 {min_m} 人で全棟対応可能")
-
-    def _auto_depot(self):
-        """デポ設定モードに応じてデポのインデックスを返す"""
-        mode = self.depot_mode_var.get()
-        if not self.nodes:
-            return 0
-        if mode == "center":
-            # エリア重心に最も近い建物をデポに設定
-            arr = np.array(self.nodes)
-            c   = arr.mean(axis=0)
-            return int(np.argmin(np.linalg.norm(arr - c, axis=1)))
-        return random.randrange(len(self.nodes))
+            text=f"状態: 完了 — 拠点{len(depot_indices)}箇所、最小 {total_min_m} 人で全棟対応可能")
 
     def on_canvas_click(self, event):
-        """キャンバスクリック: デポ指定モードならデポを変更、通常は建物を追加"""
+        """キャンバスクリック: 建物を1棟追加する"""
         if event.inaxes != self.ax or self.solving:
             return
         x, y = event.xdata, event.ydata
@@ -529,26 +714,17 @@ class TSPApp:
         nx = (x - xlim[0]) / (xlim[1] - xlim[0])
         ny = (y - ylim[0]) / (ylim[1] - ylim[0])
 
-        if self.depot_mode_var.get() == "click" and self.nodes:
-            # クリック位置に最も近い既存建物をデポに設定
-            arr = np.array(self.nodes)
-            self.depot_idx = int(
-                np.argmin(np.linalg.norm(arr - [nx, ny], axis=1)))
-            self.depot_label.config(
-                text=f"デポ: 拠点 #{self.depot_idx} (クリック指定)")
-            self.routes = []
-            self._redraw()
-        else:
-            try:
-                t_min = float(self.tmin_var.get())
-                t_max = float(self.tmax_var.get())
-            except Exception:
-                t_min, t_max = 15, 45
-            self.nodes.append((nx, ny))
-            self.inspect_times.append(random.uniform(t_min * 60, t_max * 60))
-            self.routes = []
-            self.stat_nodes.config(text=f"建物数: {len(self.nodes):,}")
-            self._redraw()
+        try:
+            t_min = float(self.tmin_var.get())
+            t_max = float(self.tmax_var.get())
+        except Exception:
+            t_min, t_max = 15, 45
+        self.nodes.append((nx, ny))
+        self.inspect_times.append(random.uniform(t_min * 60, t_max * 60))
+        self.routes = []
+        self.depot_indices = []
+        self.stat_nodes.config(text=f"建物数: {len(self.nodes):,}")
+        self._redraw()
 
     # ── 描画 ─────────────────────────────────────────────────────────────────
 
@@ -606,18 +782,54 @@ class TSPApp:
             self.ax.scatter(coords[:, 0], coords[:, 1],
                             c="#4CAF50", s=size, alpha=0.75, zorder=3)
 
-        # デポを金色の星マークで表示
-        dep = self.depot_idx if self.nodes else 0
-        if 0 <= dep < n:
-            self.ax.scatter([coords[dep, 0]], [coords[dep, 1]],
-                            c="#E53935", s=200, marker="*",
+        # 拠点を赤い星マークで表示（複数拠点対応）
+        deps = [d for d in self.depot_indices if 0 <= d < n]
+        if deps:
+            dep_coords = coords[deps]
+            self.ax.scatter(dep_coords[:, 0], dep_coords[:, 1],
+                            c="#E53935", s=220, marker="*",
                             edgecolors="white", linewidths=0.8, zorder=6,
-                            label="デポ")
+                            label=f"拠点 ({len(deps)}箇所)")
             self.ax.legend(loc="upper right", fontsize=9,
                            facecolor="#ffffff", labelcolor="#333333",
                            edgecolor="#cccccc")
 
+        self._draw_scale_bar()
         self.canvas.draw_idle()
+
+    def _draw_scale_bar(self):
+        """
+        地図左下にスケールバー（縮尺）を表示する。
+        座標系は [0,1]x[0,1] を area_km(km) にマッピングしているため、
+        1座標単位 = area_km km として、見やすい丸数字の距離を自動選択する。
+        """
+        try:
+            area_km = float(self.area_var.get())
+            if area_km <= 0:
+                return
+        except Exception:
+            return
+
+        # 表示範囲の概ね15〜25%を占める「丸い」距離を選ぶ
+        target_km = area_km * 0.2
+        candidates = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+        bar_km = min(candidates, key=lambda c: abs(c - target_km))
+
+        bar_frac = bar_km / area_km  # プロット座標系での長さ
+
+        x0, y0 = 0.04, 0.04          # 左下の開始位置（軸内の相対座標）
+        x1 = x0 + bar_frac
+
+        self.ax.plot([x0, x1], [y0, y0], "-", color="#333333",
+                     linewidth=2, solid_capstyle="butt", zorder=10)
+        # 端の縦線
+        for x in (x0, x1):
+            self.ax.plot([x, x], [y0 - 0.008, y0 + 0.008], "-",
+                         color="#333333", linewidth=2, zorder=10)
+        label = f"{bar_km:g} km" if bar_km < 1 else f"{int(bar_km)} km"
+        self.ax.text((x0 + x1) / 2, y0 + 0.018, label,
+                     ha="center", va="bottom", fontsize=8.5,
+                     color="#333333", zorder=10)
 
     def _update_per_text(self, per_time, per_dist=None):
         """判定士ごとの稼働時間・移動距離テーブルを更新する"""
@@ -648,7 +860,7 @@ class TSPApp:
             max_work  = float(self.maxwork_var.get());  assert max_work > 0
             area_km   = float(self.area_var.get());     assert area_km > 0
             n_workers = max(1, int(self.workers_var.get()))
-            n_starts  = max(1, int(self.starts_var.get()))
+            n_depots  = max(1, int(self.depot_n_var.get()))
         except Exception:
             messagebox.showerror("エラー", "入力値を確認してください")
             return
@@ -656,39 +868,30 @@ class TSPApp:
         if m > len(COLORS):
             messagebox.showerror("エラー", f"判定士数は {len(COLORS)} 以下にしてください")
             return
-
-        # デポ候補リストを生成（並列試行回数分）
-        mode = self.depot_mode_var.get()
-        if mode == "click":
-            depots = [self.depot_idx] * n_starts
-        elif mode == "center":
-            depots = [self._auto_depot()] * n_starts
-        else:
-            depots = random.sample(range(len(self.nodes)),
-                                   min(n_starts, len(self.nodes)))
+        n_depots = min(n_depots, len(self.nodes))
 
         self.solving = True
         self.solve_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.stat_status.config(text="状態: 計算中...")
+        self.stat_status.config(text="状態: 拠点を自動配置して計算中...")
         self.stat_m.config(text=f"判定士数: {m}")
         self.progress.start(10)
 
         threading.Thread(
             target=self._solve_worker,
             args=(list(self.nodes), list(self.inspect_times),
-                  m, speed, max_work, area_km, n_workers, depots),
+                  m, speed, max_work, area_km, n_workers, n_depots),
             daemon=True).start()
 
     def _solve_worker(self, nodes, inspect_times, m, speed,
-                      max_work, area_km, n_workers, depots):
+                      max_work, area_km, n_workers, n_depots):
         """ソルバーのバックグラウンドスレッド本体"""
         coords = np.array(nodes)
         it     = np.array(inspect_times, dtype=np.float64)
         t0     = time.perf_counter()
         try:
-            res     = _parallel_mtsp(coords, it, depots,
-                                     m, area_km, speed, max_work, n_workers)
+            res     = _solve_multi_depot(coords, it, n_depots, m,
+                                         area_km, speed, max_work, n_workers)
             elapsed = time.perf_counter() - t0
             self.root.after(0, self._on_done, res, elapsed)
         except Exception as e:
@@ -709,12 +912,12 @@ class TSPApp:
             self.stat_status.config(text="状態: 失敗")
             return
 
-        makespan, total_dist, routes, per_time, per_dist, unassigned = res
-        self.routes     = routes
-        self.per_time   = per_time
-        self.per_dist   = per_dist
-        self.unassigned = unassigned
-        self.depot_idx  = routes[0][0]
+        makespan, total_dist, routes, per_time, per_dist, unassigned, depot_indices = res
+        self.routes       = routes
+        self.per_time     = per_time
+        self.per_dist     = per_dist
+        self.unassigned   = unassigned
+        self.depot_indices = depot_indices
 
         h = int(makespan); mn = int((makespan - h) * 60)
         self.stat_makespan.config(text=f"最大終了時間: {h}h{mn:02d}m")
@@ -727,6 +930,7 @@ class TSPApp:
         self.stat_dist.config(text=f"総移動距離: {total_dist:.1f} km")
         self.stat_time.config(text=f"計算時間: {elapsed:.3f} 秒")
         self.stat_status.config(text="状態: 完了")
+        self.depot_label.config(text=f"拠点: {len(depot_indices)} 箇所に自動配置")
         self._update_per_text(per_time, per_dist)
         self._redraw()
 
